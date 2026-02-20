@@ -1,114 +1,309 @@
-const WebSocket = require('ws');
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
 const http = require('http');
+const WebSocket = require('ws');
+const { v4: uuidv4 } = require('uuid');
 
-// Create HTTP server
-const server = http.createServer((req, res) => {
-  // Health check endpoint (Render needs this) [citation:1]
-  if (req.url === '/healthz') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('OK');
-    return;
-  }
+const app = express();
+const server = http.createServer(app);
+const PORT = process.env.PORT || 3000;
 
-  // Simple status page
-  res.writeHead(200, { 'Content-Type': 'text/html' });
-  res.end(`
-    <html>
-      <head><title>Agent C Signaling Server</title></head>
-      <body style="font-family: Arial; background: #000; color: #fff;">
-        <h1 style="color: #9c27b0;">Agent C Signaling Server</h1>
-        <p>Status: <span style="color: #00ff00;">RUNNING</span></p>
-        <p>WebSocket endpoint: wss://your-server.onrender.com</p>
-        <p>This server handles WebRTC signaling for Agent C app.</p>
-      </body>
-    </html>
-  `);
-});
+// Initialize Supabase
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
 
-// Create WebSocket server
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// WebSocket server on the same HTTP server
 const wss = new WebSocket.Server({ server });
 
-// Store all connected clients
-const clients = new Map();
+// Store active WebSocket connections
+const activeConnections = new Map();
 
+// ============= WEBSOCKET SIGNALING =============
 wss.on('connection', (ws, req) => {
-  console.log('New client connected');
+  console.log('🔌 New WebSocket connection');
 
-  // Assign a temporary ID
-  const clientId = Date.now().toString();
-  clients.set(clientId, ws);
+  let connectedAgentId = null;
 
-  // Send the client their ID
-  ws.send(JSON.stringify({
-    type: 'connected',
-    clientId: clientId,
-    message: 'Connected to signaling server'
-  }));
-
-  // Handle messages from clients
-  ws.on('message', (data) => {
+  ws.on('message', async (message) => {
     try {
-      const message = JSON.parse(data);
-      console.log('Received:', message.type);
+      const data = JSON.parse(message);
+      console.log('📩 WebSocket message:', data.type);
 
-      // Handle different message types
-      switch (message.type) {
+      switch (data.type) {
         case 'register':
-          // Client wants to register with a specific agent ID
-          const oldId = clientId;
-          clients.delete(oldId);
-          clients.set(message.agentId, ws);
+          // Register agent with WebSocket
+          connectedAgentId = data.agentId;
+          activeConnections.set(data.agentId, ws);
+          console.log(`✅ Agent ${data.agentId} registered`);
+
+          // Update online status in database
+          await supabase
+            .from('agents')
+            .update({
+              is_online: true,
+              last_seen: new Date().toISOString(),
+              connection_info: data.connectionInfo || {}
+            })
+            .eq('agent_id', data.agentId);
+
           ws.send(JSON.stringify({
             type: 'registered',
-            agentId: message.agentId,
-            message: 'Agent registered successfully'
+            status: 'online',
+            agentId: data.agentId
           }));
-          console.log(`Agent ${message.agentId} registered`);
           break;
 
         case 'signal':
-          // Forward signal to target agent
-          const targetWs = clients.get(message.target);
+          // Forward WebRTC signaling data
+          const targetWs = activeConnections.get(data.targetAgentId);
           if (targetWs && targetWs.readyState === WebSocket.OPEN) {
             targetWs.send(JSON.stringify({
               type: 'signal',
-              from: message.from,
-              signal: message.signal
+              from: data.fromAgentId,
+              signal: data.signal
             }));
+            console.log(`📤 Signal forwarded to ${data.targetAgentId}`);
           } else {
-            ws.send(JSON.stringify({
-              type: 'error',
-              message: 'Target agent not found or offline'
-            }));
+            console.log(`⚠️ Target agent ${data.targetAgentId} not online`);
           }
           break;
 
         case 'ping':
-          // Keep-alive
           ws.send(JSON.stringify({ type: 'pong' }));
           break;
       }
-    } catch (e) {
-      console.error('Error processing message:', e);
+    } catch (error) {
+      console.error('WebSocket message error:', error);
     }
   });
 
-  // Handle disconnection
-  ws.on('close', () => {
-    console.log('Client disconnected');
-    // Find and remove client from map
-    for (let [id, socket] of clients.entries()) {
-      if (socket === ws) {
-        clients.delete(id);
-        break;
+  ws.on('close', async () => {
+    if (connectedAgentId) {
+      // Update offline status
+      await supabase
+        .from('agents')
+        .update({
+          is_online: false,
+          last_seen: new Date().toISOString()
+        })
+        .eq('agent_id', connectedAgentId);
+
+      activeConnections.delete(connectedAgentId);
+      console.log(`📴 Agent ${connectedAgentId} offline`);
+    }
+  });
+});
+
+// ============= REST API ENDPOINTS =============
+
+// 1. Agent Registration
+app.post('/api/agents/register', async (req, res) => {
+  try {
+    const { agentId, publicKey, deviceFingerprint, deviceInfo } = req.body;
+    console.log(`📝 Registering agent: ${agentId}`);
+
+    // Check if agent already exists
+    const { data: existingAgent } = await supabase
+      .from('agents')
+      .select('agent_id')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+
+    if (existingAgent) {
+      return res.status(409).json({
+        error: 'Agent ID already exists. Choose a different ID.'
+      });
+    }
+
+    // Register new agent
+    const { data, error } = await supabase
+      .from('agents')
+      .insert([
+        {
+          agent_id: agentId,
+          public_key: publicKey,
+          device_fingerprint: deviceFingerprint,
+          devices: [{
+            id: uuidv4(),
+            fingerprint: deviceFingerprint,
+            info: deviceInfo,
+            registered_at: new Date().toISOString()
+          }],
+          created_at: new Date().toISOString(),
+          is_online: false
+        }
+      ])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.status(201).json({
+      success: true,
+      message: 'Agent registered successfully',
+      agent: {
+        id: data.agent_id,
+        created_at: data.created_at
+      }
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// 2. Agent Login/Heartbeat
+app.post('/api/agents/:agentId/heartbeat', async (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const { connectionInfo } = req.body;
+
+    const { data, error } = await supabase
+      .from('agents')
+      .update({
+        last_seen: new Date().toISOString(),
+        is_online: true,
+        connection_info: connectionInfo
+      })
+      .eq('agent_id', agentId)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      status: 'online',
+      last_seen: data.last_seen
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Heartbeat failed' });
+  }
+});
+
+// 3. Find Agent by ID
+app.get('/api/agents/find/:agentId', async (req, res) => {
+  try {
+    const { agentId } = req.params;
+
+    const { data, error } = await supabase
+      .from('agents')
+      .select('agent_id, public_key, is_online, last_seen, connection_info')
+      .eq('agent_id', agentId)
+      .single();
+
+    if (error) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    res.json({
+      success: true,
+      agent: {
+        id: data.agent_id,
+        publicKey: data.public_key,
+        isOnline: data.is_online,
+        lastSeen: data.last_seen,
+        connectionInfo: data.connection_info
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
+// 4. Search Agents (by partial ID)
+app.get('/api/agents/search', async (req, res) => {
+  try {
+    const { query } = req.query;
+
+    const { data, error } = await supabase
+      .from('agents')
+      .select('agent_id, is_online, last_seen')
+      .ilike('agent_id', `%${query}%`)
+      .limit(20);
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      agents: data
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
+// 5. Get Agent Status
+app.get('/api/agents/:agentId/status', async (req, res) => {
+  try {
+    const { agentId } = req.params;
+
+    const { data, error } = await supabase
+      .from('agents')
+      .select('is_online, last_seen')
+      .eq('agent_id', agentId)
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      agentId,
+      isOnline: data.is_online,
+      lastSeen: data.last_seen
+    });
+  } catch (error) {
+    res.status(404).json({ error: 'Agent not found' });
+  }
+});
+
+// 6. Root endpoint for testing
+app.get('/', (req, res) => {
+  res.json({
+    name: 'Agent C Signaling Server',
+    status: 'operational',
+    version: '1.0.0',
+    connections: activeConnections.size,
+    timestamp: new Date().toISOString(),
+    endpoints: {
+      websocket: `ws://${req.headers.host}`,
+      rest: {
+        register: 'POST /api/agents/register',
+        find: 'GET /api/agents/find/:agentId',
+        search: 'GET /api/agents/search?query=',
+        status: 'GET /api/agents/:agentId/status',
+        heartbeat: 'POST /api/agents/:agentId/heartbeat'
       }
     }
   });
 });
 
 // Start server
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log(`Signaling server running on port ${PORT}`);
-  console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`
+┌─────────────────────────────────────────┐
+│   🕵️  Agent C Signaling Server         │
+├─────────────────────────────────────────┤
+│   Port: ${PORT}
+│   HTTP API: http://localhost:${PORT}/
+│   WebSocket: ws://localhost:${PORT}
+│   Status: ✅ ONLINE
+│   Phase: 3 - Global Connectivity
+└─────────────────────────────────────────┘
+  `);
+});
+
+// Handle graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Closing connections...');
+  wss.close();
+  server.close();
+  process.exit(0);
 });
